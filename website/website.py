@@ -19,7 +19,7 @@ import os
 import os.path
 import time
 import tornado.web
-import tornado.wsgi
+import tornado.httpserver
 import wsgiref.handlers
 
 
@@ -49,15 +49,17 @@ settings = {
     "template_path": os.path.join(os.path.dirname(__file__), "templates"),
     "xsrf_cookies": True,
     "debug": os.environ.get("SERVER_SOFTWARE", "").startswith("Development/"),
+    "static_path": os.path.join(os.path.dirname(__file__), "static"),
 }
-application = tornado.wsgi.WSGIApplication([
+application = tornado.web.Application([
     (r"/([a-z]*)", ContentHandler),
 ], **settings)
 
 
 def main():
-    wsgiref.handlers.CGIHandler().run(application)
-
+    http_server = tornado.httpserver.HTTPServer(application)
+    http_server.listen(8001)
+    tornado.ioloop.IOLoop.instance().start()
 
 if __name__ == "__main__":
     main()
