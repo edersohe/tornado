@@ -50,63 +50,112 @@ class Application(tornado.web.Application):
 
 class BaseHandler(tornado.web.RequestHandler):
     def get_current_user(self):
-        user_json = self.get_secure_cookie("user")
-        if not user_json: return None
-        return tornado.escape.json_decode(user_json)
-
-
-class MainHandler(BaseHandler):
-    @tornado.web.authenticated
-    def get(self):
-        self.render("index.html", messages=MessageMixin.cache)
-
+        return self.get_secure_cookie("user")
+    
 
 class MessageMixin(object):
-    waiters = []
-    cache = []
+    waiters = {}
+    cache = {}
     cache_size = 200
 
-    def wait_for_messages(self, callback, cursor=None):
+    def wait_for_messages(self, callback, cursor=None, owner=None):
+        """owner is a propietary of callback"""
+        
         cls = MessageMixin
+
+        if not owner in cls.cache:
+            cls.cache[owner] = []
+
         if cursor:
             index = 0
-            for i in xrange(len(cls.cache)):
-                index = len(cls.cache) - i - 1
-                if cls.cache[index]["id"] == cursor: break
-            recent = cls.cache[index + 1:]
+            for i in xrange(len(cls.cache[owner])):
+                index = len(cls.cache[owner]) - i - 1
+                if cls.cache[owner][index]["id"] == cursor: break
+            recent = cls.cache[owner][index + 1:]
             if recent:
                 callback(recent)
                 return
-        cls.waiters.append(callback)
+        try:
+            cls.waiters[owner].append(callback)
+        except KeyError:
+            cls.waiters[owner] = [callback]
 
-    def new_messages(self, messages):
+    def new_messages(self, messages, dst=[]):
+        """dst is a list of users where messages its sending,
+        when dst list is empty messages send to all members"""
+        
         cls = MessageMixin
-        logging.info("Sending new message to %r listeners", len(cls.waiters))
-        for callback in cls.waiters:
+
+        if len(dst)<1:
+            for owner in cls.waiters:
+                self._parse(owner, messages)
+
+        else:
+            for owner in dst:
+                if not owner in cls.waiters and owner in cls.cache:
+                    cls.waiters[owner]=[]
+                if owner in cls.waiters:
+                    self._parse(owner, messages)
+
+    def _parse(self,owner, messages):
+        cls = MessageMixin
+
+        logging.info("Sending new message to %r listeners", len(cls.waiters[owner]))
+        for callback in cls.waiters[owner]:
             try:
                 callback(messages)
             except:
                 logging.error("Error in waiter callback", exc_info=True)
-        cls.waiters = []
-        cls.cache.extend(messages)
-        if len(cls.cache) > self.cache_size:
-            cls.cache = cls.cache[-self.cache_size:]
+        cls.waiters[owner] = []
+        cls.cache[owner].extend(messages)
+        if len(cls.cache[owner]) > self.cache_size:
+            cls.cache[owner] = cls.cache[owner][-self.cache_size:]
 
 
-class MessageNewHandler(BaseHandler, MessageMixin):
+class MainHandler(BaseHandler, MessageMixin):
     @tornado.web.authenticated
-    def post(self):
+    def get(self):
+        logging.info(self.current_user)
+        if not self.current_user in self.cache:
+            self.cache[self.current_user] = []
         message = {
             "id": str(uuid.uuid4()),
-            "from": self.current_user["first_name"],
-            "body": self.get_argument("body"),
+            "from": self.current_user,
+            "body": "I START SESSION",
+        }
+        message["html"] = self.render_string("message.html", message=message)
+        self.new_messages([message])
+        self.render("index.html", messages=self.cache[self.current_user])
+        
+
+class MessageNewHandler(BaseHandler, MessageMixin):
+    """Send private messages if you write on chatbox: 
+        username::this is the messages for the username"""
+        
+    @tornado.web.authenticated
+    def post(self):
+        msg =  self.get_argument("body").split('::',1)
+        to = []
+        if len(msg)>1:
+            to = [msg[0], self.current_user]
+            msg = 'to ' + to[0] + ' -> '  + msg[1].strip()
+        else:
+            msg = msg[0]
+        message = {
+            "id": str(uuid.uuid4()),
+            "from": self.current_user,
+            "body": msg,
         }
         message["html"] = self.render_string("message.html", message=message)
         if self.get_argument("next", None):
             self.redirect(self.get_argument("next"))
         else:
             self.write(message)
-        self.new_messages([message])
+
+        if len(to)>=1:
+            self.new_messages([message], to)
+        else:
+            self.new_messages([message])
 
 
 class MessageUpdatesHandler(BaseHandler, MessageMixin):
@@ -115,7 +164,7 @@ class MessageUpdatesHandler(BaseHandler, MessageMixin):
     def post(self):
         cursor = self.get_argument("cursor", None)
         self.wait_for_messages(self.async_callback(self.on_new_messages),
-                               cursor=cursor)
+                               cursor=cursor, owner=self.current_user)
 
     def on_new_messages(self, messages):
         # Closed client connection
@@ -130,12 +179,12 @@ class AuthLoginHandler(BaseHandler, tornado.auth.GoogleMixin):
         if self.get_argument("openid.mode", None):
             self.get_authenticated_user(self.async_callback(self._on_auth))
             return
-        self.authenticate_redirect(ax_attrs=["name"])
+        self.authenticate_redirect(ax_attrs=["email"])
     
     def _on_auth(self, user):
         if not user:
             raise tornado.web.HTTPError(500, "Google auth failed")
-        self.set_secure_cookie("user", tornado.escape.json_encode(user))
+        self.set_secure_cookie("user", user['name'])
         self.redirect("/")
 
 
