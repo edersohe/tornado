@@ -21,13 +21,14 @@ import collections
 import cStringIO
 import email.utils
 import errno
+import escape
 import functools
 import httplib
 import ioloop
 import logging
 import pycurl
 import time
-
+import weakref
 
 class HTTPClient(object):
     """A blocking HTTP client backed with pycurl.
@@ -100,14 +101,14 @@ class AsyncHTTPClient(object):
     determines the maximum number of simultaneous fetch() operations that
     can execute in parallel on each IOLoop.
     """
-    _ASYNC_CLIENTS = {}
+    _ASYNC_CLIENTS = weakref.WeakKeyDictionary()
 
     def __new__(cls, io_loop=None, max_clients=10,
                 max_simultaneous_connections=None):
         # There is one client per IOLoop since they share curl instances
         io_loop = io_loop or ioloop.IOLoop.instance()
-        if id(io_loop) in cls._ASYNC_CLIENTS:
-            return cls._ASYNC_CLIENTS[id(io_loop)]
+        if io_loop in cls._ASYNC_CLIENTS:
+            return cls._ASYNC_CLIENTS[io_loop]
         else:
             instance = super(AsyncHTTPClient, cls).__new__(cls)
             instance.io_loop = io_loop
@@ -120,8 +121,21 @@ class AsyncHTTPClient(object):
             instance._events = {}
             instance._added_perform_callback = False
             instance._timeout = None
-            cls._ASYNC_CLIENTS[id(io_loop)] = instance
+            instance._closed = False
+            cls._ASYNC_CLIENTS[io_loop] = instance
             return instance
+
+    def close(self):
+        """Destroys this http client, freeing any file descriptors used.
+        Not needed in normal use, but may be helpful in unittests that
+        create and destroy http clients.  No other methods may be called
+        on the AsyncHTTPClient after close().
+        """
+        del AsyncHTTPClient._ASYNC_CLIENTS[self.io_loop]
+        for curl in self._curls:
+            curl.close()
+        self._multi.close()
+        self._closed = True
 
     def fetch(self, request, callback, **kwargs):
         """Executes an HTTPRequest, calling callback with an HTTPResponse.
@@ -151,6 +165,9 @@ class AsyncHTTPClient(object):
 
     def _perform(self):
         self._added_perform_callback = False
+
+        if self._closed:
+            return
 
         while True:
             while True:
@@ -209,9 +226,32 @@ class AsyncHTTPClient(object):
         for fd in exceptable:
             fds[fd] = fds.get(fd, 0) | 0x8 | 0x10
 
+        if fds and max(fds.iterkeys()) > 900:
+            # Libcurl has a bug in which it behaves unpredictably with
+            # file descriptors greater than 1024.  (This is because
+            # even though it uses poll() instead of select(), it still
+            # uses FD_SET internally) Since curl opens its own file
+            # descriptors we can't catch this problem when it happens,
+            # and the best we can do is detect that it's about to
+            # happen.  Exiting is a lousy way to handle this error,
+            # but there's not much we can do at this point.  Exiting
+            # (and getting restarted by whatever monitoring process
+            # is handling crashed tornado processes) will at least
+            # get things working again and hopefully bring the issue
+            # to someone's attention.
+            # If you run into this issue, you either have a file descriptor
+            # leak or need to run more tornado processes (so that none
+            # of them are handling more than 1000 simultaneous connections)
+            print >> sys.stderr, "ERROR: File descriptor too high for libcurl. Exiting."
+            sys.exit(1)
+
         for fd in self._fds:
             if fd not in fds:
-                self.io_loop.remove_handler(fd)
+                try:
+                    self.io_loop.remove_handler(fd)
+                except (OSError, IOError), e:
+                    if e[0] != errno.ENOENT:
+                        raise
 
         for fd, events in fds.iteritems():
             old_events = self._fds.get(fd, None)
@@ -220,7 +260,7 @@ class AsyncHTTPClient(object):
             elif old_events != events:
                 try:
                     self.io_loop.update_handler(fd, events)
-                except OSError, e:
+                except (OSError, IOError), e:
                     if e[0] == errno.ENOENT:
                         self.io_loop.add_handler(fd, self._handle_events,
                                                  events)
@@ -253,10 +293,11 @@ class AsyncHTTPClient(object):
 class HTTPRequest(object):
     def __init__(self, url, method="GET", headers={}, body=None,
                  auth_username=None, auth_password=None,
-                 connect_timeout=None, request_timeout=None,
+                 connect_timeout=20.0, request_timeout=20.0,
                  if_modified_since=None, follow_redirects=True,
                  max_redirects=5, user_agent=None, use_gzip=True,
-                 network_interface=None, streaming_callback=None):
+                 network_interface=None, streaming_callback=None,
+                 header_callback=None, prepare_curl_callback=None):
         if if_modified_since:
             timestamp = calendar.timegm(if_modified_since.utctimetuple())
             headers["If-Modified-Since"] = email.utils.formatdate(
@@ -269,14 +310,16 @@ class HTTPRequest(object):
         self.body = body
         self.auth_username = _utf8(auth_username)
         self.auth_password = _utf8(auth_password)
-        self.connect_timeout = connect_timeout or 20.0
-        self.request_timeout = request_timeout or 20.0
+        self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
         self.user_agent = user_agent
         self.use_gzip = use_gzip
         self.network_interface = network_interface
         self.streaming_callback = streaming_callback
+        self.header_callback = header_callback
+        self.prepare_curl_callback = prepare_curl_callback
 
 
 class HTTPResponse(object):
@@ -313,7 +356,7 @@ class HTTPError(Exception):
         self.code = code
         message = message or httplib.responses.get(code, "Unknown")
         Exception.__init__(self, "HTTP %d: %s" % (self.code, message))
-                
+
 
 class CurlError(HTTPError):
     def __init__(self, errno, message):
@@ -334,12 +377,11 @@ def _curl_setup_request(curl, request, buffer, headers):
     curl.setopt(pycurl.URL, request.url)
     curl.setopt(pycurl.HTTPHEADER,
                 ["%s: %s" % i for i in request.headers.iteritems()])
-    try:
+    if request.header_callback:
+        curl.setopt(pycurl.HEADERFUNCTION, request.header_callback)
+    else:
         curl.setopt(pycurl.HEADERFUNCTION,
-                    functools.partial(_curl_header_callback, headers))
-    except:
-        # Old version of curl; response will not include headers
-        pass
+                    lambda line: _curl_header_callback(headers, line))
     if request.streaming_callback:
         curl.setopt(pycurl.WRITEFUNCTION, request.streaming_callback)
     else:
@@ -360,20 +402,27 @@ def _curl_setup_request(curl, request, buffer, headers):
         curl.setopt(pycurl.ENCODING, "none")
 
     # Set the request method through curl's retarded interface which makes
-    # up names for every single method
+    # up names for almost every single method
     curl_options = {
         "GET": pycurl.HTTPGET,
         "POST": pycurl.POST,
         "PUT": pycurl.UPLOAD,
         "HEAD": pycurl.NOBODY,
     }
+    custom_methods = set(["DELETE"])
     for o in curl_options.values():
         curl.setopt(o, False)
-    curl.setopt(curl_options[request.method], True)
+    if request.method in curl_options:
+        curl.unsetopt(pycurl.CUSTOMREQUEST)
+        curl.setopt(curl_options[request.method], True)
+    elif request.method in custom_methods:
+        curl.setopt(pycurl.CUSTOMREQUEST, request.method)
+    else:
+        raise KeyError('unknown method ' + request.method)
 
     # Handle curl's cryptic options for every individual HTTP method
     if request.method in ("POST", "PUT"):
-        request_buffer =  cStringIO.StringIO(request.body)
+        request_buffer =  cStringIO.StringIO(escape.utf8(request.body))
         curl.setopt(pycurl.READFUNCTION, request_buffer.read)
         if request.method == "POST":
             def ioctl(cmd):
@@ -393,6 +442,8 @@ def _curl_setup_request(curl, request, buffer, headers):
     else:
         curl.unsetopt(pycurl.USERPWD)
         logging.info("%s %s", request.method, request.url)
+    if request.prepare_curl_callback is not None:
+        request.prepare_curl_callback(curl)
 
 
 def _curl_header_callback(headers, header_line):
@@ -401,11 +452,16 @@ def _curl_header_callback(headers, header_line):
         return
     if header_line == "\r\n":
         return
-    parts = header_line.split(": ")
+    parts = header_line.split(":", 1)
     if len(parts) != 2:
         logging.warning("Invalid HTTP response header line %r", header_line)
         return
-    headers[parts[0].strip()] = parts[1].strip()
+    name = parts[0].strip()
+    value = parts[1].strip()
+    if name in headers:
+        headers[name] = headers[name] + ',' + value
+    else:
+        headers[name] = value
 
 
 def _curl_debug(debug_type, debug_msg):

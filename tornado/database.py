@@ -24,7 +24,6 @@ import MySQLdb.cursors
 import itertools
 import logging
 
-
 class Connection(object):
     """A lightweight wrapper around MySQLdb DB-API connections.
 

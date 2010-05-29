@@ -60,7 +60,6 @@ import time
 import urllib
 import web
 
-
 class WSGIApplication(web.Application):
     """A WSGI-equivalent of web.Application.
 
@@ -210,22 +209,31 @@ class WSGIContainer(object):
 
     def __call__(self, request):
         data = {}
-        def start_response(status, response_headers):
+        response = []
+        def start_response(status, response_headers, exc_info=None):
             data["status"] = status
-            data["headers"] = HTTPHeaders(response_headers)
-        body = "".join(self.wsgi_application(
-            self._environ(request), start_response))
+            data["headers"] = response_headers
+            return response.append
+        response.extend(self.wsgi_application(
+                WSGIContainer.environ(request), start_response))
+        body = "".join(response)
+        if hasattr(response, "close"):
+            response.close()
         if not data: raise Exception("WSGI app did not call start_response")
 
         status_code = int(data["status"].split()[0])
         headers = data["headers"]
+        header_set = set(k.lower() for (k,v) in headers)
         body = escape.utf8(body)
-        headers["Content-Length"] = str(len(body))
-        headers.setdefault("Content-Type", "text/html; charset=UTF-8")
-        headers.setdefault("Server", "TornadoServer/0.1")
+        if "content-length" not in header_set:
+            headers.append(("Content-Length", str(len(body))))
+        if "content-type" not in header_set:
+            headers.append(("Content-Type", "text/html; charset=UTF-8"))
+        if "server" not in header_set:
+            headers.append(("Server", "TornadoServer/0.1"))
 
         parts = ["HTTP/1.1 " + data["status"] + "\r\n"]
-        for key, value in headers.iteritems():
+        for key, value in headers:
             parts.append(escape.utf8(key) + ": " + escape.utf8(value) + "\r\n")
         parts.append("\r\n")
         parts.append(body)
@@ -233,7 +241,8 @@ class WSGIContainer(object):
         request.finish()
         self._log(status_code, request)
 
-    def _environ(self, request):
+    @staticmethod
+    def environ(request):
         hostport = request.host.split(":")
         if len(hostport) == 2:
             host = hostport[0]
@@ -246,11 +255,13 @@ class WSGIContainer(object):
             "SCRIPT_NAME": "",
             "PATH_INFO": request.path,
             "QUERY_STRING": request.query,
+            "REMOTE_ADDR": request.remote_ip,
             "SERVER_NAME": host,
             "SERVER_PORT": port,
+            "SERVER_PROTOCOL": request.version,
             "wsgi.version": (1, 0),
             "wsgi.url_scheme": request.protocol,
-            "wsgi.input": cStringIO.StringIO(request.body),
+            "wsgi.input": cStringIO.StringIO(escape.utf8(request.body)),
             "wsgi.errors": sys.stderr,
             "wsgi.multithread": False,
             "wsgi.multiprocess": True,
@@ -293,6 +304,6 @@ class HTTPHeaders(dict):
         headers = cls()
         for line in headers_string.splitlines():
             if line:
-                name, value = line.split(": ", 1)
-                headers[name] = value
+                name, value = line.split(":", 1)
+                headers[name] = value.strip()
         return headers

@@ -18,7 +18,6 @@
 
 import cgi
 import errno
-import fcntl
 import functools
 import ioloop
 import iostream
@@ -29,10 +28,17 @@ import time
 import urlparse
 
 try:
+    import fcntl
+except ImportError:
+    if os.name == 'nt':
+        import win32_support as fcntl
+    else:
+        raise
+
+try:
     import ssl # Python 2.6+
 except ImportError:
     ssl = None
-
 
 class HTTPServer(object):
     """A non-blocking, single-threaded HTTP server.
@@ -176,15 +182,22 @@ class HTTPServer(object):
             logging.info("Pre-forking %d server processes", num_processes)
             for i in range(num_processes):
                 if os.fork() == 0:
-                    ioloop.IOLoop.instance().add_handler(
+                    self.io_loop = ioloop.IOLoop.instance()
+                    self.io_loop.add_handler(
                         self._socket.fileno(), self._handle_events,
                         ioloop.IOLoop.READ)
                     return
             os.waitpid(-1, 0)
         else:
-            io_loop = self.io_loop or ioloop.IOLoop.instance()
-            io_loop.add_handler(self._socket.fileno(), self._handle_events,
-                                ioloop.IOLoop.READ)
+            if not self.io_loop:
+                self.io_loop = ioloop.IOLoop.instance()
+            self.io_loop.add_handler(self._socket.fileno(),
+                                     self._handle_events,
+                                     ioloop.IOLoop.READ)
+
+    def stop(self):
+      self.io_loop.remove_handler(self._socket.fileno())
+      self._socket.close()
 
     def _handle_events(self, fd, events):
         while True:
@@ -225,7 +238,8 @@ class HTTPConnection(object):
 
     def write(self, chunk):
         assert self._request, "Request closed"
-        self.stream.write(chunk, self._on_write_complete)
+        if not self.stream.closed():
+            self.stream.write(chunk, self._on_write_complete)
 
     def finish(self):
         assert self._request, "Request closed"
@@ -244,7 +258,7 @@ class HTTPConnection(object):
             connection_header = self._request.headers.get("Connection")
             if self._request.supports_http_1_1():
                 disconnect = connection_header == "close"
-            elif ("Content-Length" in self._request.headers 
+            elif ("Content-Length" in self._request.headers
                     or self._request.method in ("HEAD", "GET")):
                 disconnect = connection_header != "Keep-Alive"
             else:
@@ -359,13 +373,13 @@ class HTTPRequest(object):
         self.body = body or ""
         if connection and connection.xheaders:
             # Squid uses X-Forwarded-For, others use X-Real-Ip
-            self.remote_ip = headers.get(
-                "X-Real-Ip", headers.get("X-Forwarded-For", remote_ip))
-            self.protocol = headers.get("X-Scheme", protocol) or "http"
+            self.remote_ip = self.headers.get(
+                "X-Real-Ip", self.headers.get("X-Forwarded-For", remote_ip))
+            self.protocol = self.headers.get("X-Scheme", protocol) or "http"
         else:
             self.remote_ip = remote_ip
             self.protocol = protocol or "http"
-        self.host = host or headers.get("Host") or "127.0.0.1"
+        self.host = host or self.headers.get("Host") or "127.0.0.1"
         self.files = files or {}
         self.connection = connection
         self._start_time = time.time()
@@ -429,6 +443,6 @@ class HTTPHeaders(dict):
         headers = cls()
         for line in headers_string.splitlines():
             if line:
-                name, value = line.split(": ", 1)
-                headers[name] = value
+                name, value = line.split(":", 1)
+                headers[name] = value.strip()
         return headers
