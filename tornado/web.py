@@ -183,18 +183,33 @@ class RequestHandler(object):
         If default is not provided, the argument is considered to be
         required, and we throw an HTTP 404 exception if it is missing.
 
+        If the argument appears in the url more than once, we return the
+        last value.
+
         The returned value is always unicode.
         """
-        values = self.request.arguments.get(name, None)
-        if values is None:
+        args = self.get_arguments(name, strip=strip)
+        if not args:
             if default is self._ARG_DEFAULT:
                 raise HTTPError(404, "Missing argument %s" % name)
             return default
+        return args[-1]
+
+    def get_arguments(self, name, strip=True):
+        """Returns a list of the arguments with the given name.
+
+        If the argument is not present, returns an empty list.
+
+        The returned values are always unicode.
+        """
+        values = self.request.arguments.get(name, [])
         # Get rid of any weird control chars
-        value = re.sub(r"[\x00-\x08\x0e-\x1f]", " ", values[-1])
-        value = _unicode(value)
-        if strip: value = value.strip()
-        return value
+        values = [re.sub(r"[\x00-\x08\x0e-\x1f]", " ", x) for x in values]
+        values = [_unicode(x) for x in values]
+        if strip:
+            values = [x.strip() for x in values]
+        return values
+
 
     @property
     def cookies(self):
@@ -496,6 +511,13 @@ class RequestHandler(object):
             if "Content-Length" not in self._headers:
                 content_length = sum(len(part) for part in self._write_buffer)
                 self.set_header("Content-Length", content_length)
+
+        if hasattr(self.request, "connection"):
+            # Now that the request is finished, clear the callback we
+            # set on the IOStream (which would otherwise prevent the
+            # garbage collection of the RequestHandler when there
+            # are keepalive connections)
+            self.request.connection.stream.set_close_callback(None)
 
         if not self.application._wsgi:
             self.flush(include_footers=True)
