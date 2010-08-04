@@ -53,6 +53,11 @@ settings = {
 }
 application = tornado.web.Application([
     (r"/([a-z]*)", ContentHandler),
+    (r"/static/tornado-0.1.tar.gz", tornado.web.RedirectHandler,
+     dict(url="http://github.com/downloads/facebook/tornado/tornado-0.1.tar.gz")),
+    (r"/static/tornado-0.2.tar.gz", tornado.web.RedirectHandler,
+     dict(url="http://github.com/downloads/facebook/tornado/tornado-0.2.tar.gz")),
+
 ], **settings)
 
 
