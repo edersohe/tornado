@@ -178,13 +178,8 @@ class AuthLoginHandler(BaseHandler, tornado.auth.GoogleMixin):
         if self.get_argument("openid.mode", None):
             self.get_authenticated_user(self.async_callback(self._on_auth))
             return
-<<<<<<< HEAD
-        self.authenticate_redirect(ax_attrs=["email"])
-    
-=======
         self.authenticate_redirect(ax_attrs=["name"])
 
->>>>>>> tornado/master
     def _on_auth(self, user):
         if not user:
             raise tornado.web.HTTPError(500, "Google auth failed")
