@@ -304,8 +304,17 @@ class Error(Exception):
 
 def enable_pretty_logging():
     """Turns on formatted logging output as configured."""
+    root_logger = logging.getLogger()
+    if options.log_file_prefix:
+        channel = logging.handlers.RotatingFileHandler(
+            filename=options.log_file_prefix,
+            maxBytes=options.log_file_max_size,
+            backupCount=options.log_file_num_backups)
+        channel.setFormatter(_LogFormatter(color=False))
+        root_logger.addHandler(channel)
+
     if (options.log_to_stderr or
-        (options.log_to_stderr is None and not options.log_file_prefix)):
+        (options.log_to_stderr is None and not root_logger.handlers)):
         # Set up color if we are in a tty and curses is installed
         color = False
         if curses and sys.stderr.isatty():
@@ -317,15 +326,8 @@ def enable_pretty_logging():
                 pass
         channel = logging.StreamHandler()
         channel.setFormatter(_LogFormatter(color=color))
-        logging.getLogger().addHandler(channel)
+        root_logger.addHandler(channel)
 
-    if options.log_file_prefix:
-        channel = logging.handlers.RotatingFileHandler(
-            filename=options.log_file_prefix,
-            maxBytes=options.log_file_max_size,
-            backupCount=options.log_file_num_backups)
-        channel.setFormatter(_LogFormatter(color=False))
-        logging.getLogger().addHandler(channel)
 
 
 class _LogFormatter(logging.Formatter):
@@ -333,14 +335,23 @@ class _LogFormatter(logging.Formatter):
         logging.Formatter.__init__(self, *args, **kwargs)
         self._color = color
         if color:
-            fg_color = curses.tigetstr("setaf") or curses.tigetstr("setf") or ""
+            # The curses module has some str/bytes confusion in python3.
+            # Most methods return bytes, but only accept strings.
+            # The explict calls to unicode() below are harmless in python2,
+            # but will do the right conversion in python3.
+            fg_color = unicode(curses.tigetstr("setaf") or 
+                               curses.tigetstr("setf") or "", "ascii")
             self._colors = {
-                logging.DEBUG: curses.tparm(fg_color, 4), # Blue
-                logging.INFO: curses.tparm(fg_color, 2), # Green
-                logging.WARNING: curses.tparm(fg_color, 3), # Yellow
-                logging.ERROR: curses.tparm(fg_color, 1), # Red
+                logging.DEBUG: unicode(curses.tparm(fg_color, 4), # Blue
+                                       "ascii"),
+                logging.INFO: unicode(curses.tparm(fg_color, 2), # Green
+                                      "ascii"),
+                logging.WARNING: unicode(curses.tparm(fg_color, 3), # Yellow
+                                         "ascii"),
+                logging.ERROR: unicode(curses.tparm(fg_color, 1), # Red
+                                       "ascii"),
             }
-            self._normal = curses.tigetstr("sgr0")
+            self._normal = unicode(curses.tigetstr("sgr0"), "ascii")
 
     def format(self, record):
         try:
@@ -374,7 +385,8 @@ define("logging", default="info",
        metavar="info|warning|error|none")
 define("log_to_stderr", type=bool, default=None,
        help=("Send log output to stderr (colorized if possible). "
-             "By default use stderr if --log_file_prefix is not set."))
+             "By default use stderr if --log_file_prefix is not set and "
+             "no other logging is configured."))
 define("log_file_prefix", type=str, default=None, metavar="PATH",
        help=("Path prefix for log files. "
              "Note that if you are running multiple tornado processes, "

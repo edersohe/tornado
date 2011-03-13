@@ -56,6 +56,7 @@ import httplib
 import logging
 import sys
 import time
+import tornado
 import urllib
 
 from tornado import escape
@@ -111,7 +112,8 @@ class HTTPRequest(object):
             if key.startswith("HTTP_"):
                 self.headers[key[5:].replace("_", "-")] = environ[key]
         if self.headers.get("Content-Length"):
-            self.body = environ["wsgi.input"].read()
+            self.body = environ["wsgi.input"].read(
+                self.headers["Content-Length"])
         else:
             self.body = ""
         self.protocol = environ["wsgi.url_scheme"]
@@ -238,7 +240,7 @@ class WSGIContainer(object):
         if "content-type" not in header_set:
             headers.append(("Content-Type", "text/html; charset=UTF-8"))
         if "server" not in header_set:
-            headers.append(("Server", "TornadoServer/0.1"))
+            headers.append(("Server", "TornadoServer/%s" % tornado.version))
 
         parts = ["HTTP/1.1 " + data["status"] + "\r\n"]
         for key, value in headers:
@@ -294,4 +296,3 @@ class WSGIContainer(object):
         summary = request.method + " " + request.uri + " (" + \
             request.remote_ip + ")"
         log_method("%d %s %.2fms", status_code, summary, request_time)
-
